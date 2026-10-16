@@ -154,6 +154,25 @@ class Proxy:
         tpinfo = ", ".join(tpinfo)
         return f"<Proxy {self._geo.code} {self.avg_resp_time:.2f}s [{tpinfo}] {_format_host_port(self.host, self.port)}>"
 
+    def __lt__(self, other):
+        """Deterministic total order for heap/pool sorting.
+
+        ``ProxyPool`` stores proxies in a ``heapq`` keyed by
+        ``avg_resp_time``. When two priorities tie, ``heapq`` falls back
+        to comparing the second tuple element - the ``Proxy`` objects -
+        which raised ``TypeError: '<' not supported between instances of
+        'Proxy'`` and silently corrupted the pool. Ordering by
+        ``(avg_resp_time, host, port)`` guarantees a stable, total order
+        that never depends on undefined object comparison.
+        """
+        if not isinstance(other, Proxy):
+            return NotImplemented
+        return (self.avg_resp_time, self.host, self.port) < (
+            other.avg_resp_time,
+            other.host,
+            other.port,
+        )
+
     @property
     def types(self):
         """Types (protocols) supported by the proxy.

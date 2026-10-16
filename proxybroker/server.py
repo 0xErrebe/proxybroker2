@@ -57,31 +57,43 @@ class ProxyPool:
             raise ValueError("`strategy` only support `best` for now.")
 
     async def get(self, scheme):
+        """Return a proxy able to serve ``scheme``.
+
+        A proxy already known to the pool is preferred; the source queue
+        is only consulted when nothing suitable is available. This keeps
+        the server responsive while the pool is still small or the source
+        queue is temporarily drained.
+        """
         scheme = scheme.upper()
-        if len(self._pool) + len(self._newcomers) < self._min_queue:
-            chosen = await self._import(scheme)
-        elif len(self._newcomers) > 0:
-            chosen = self._newcomers.pop(0)
-        elif self._strategy == "best":
-            # Create a temporary list to store items we need to put back
-            temp_items = []
-            chosen = None
-            # Pop items from heap until we find a suitable proxy
-            while self._pool:
-                priority, proxy = heapq.heappop(self._pool)
-                if scheme in proxy.schemes:
-                    chosen = proxy
-                    # Put back the items we popped but didn't use
-                    for item in temp_items:
-                        heapq.heappush(self._pool, item)
-                    break
-                else:
-                    temp_items.append((priority, proxy))
-            else:
-                # Put back all items if we didn't find a suitable proxy
-                for item in temp_items:
-                    heapq.heappush(self._pool, item)
-                chosen = await self._import(scheme)
+
+        chosen = self._take_suitable(scheme)
+        if chosen is not None:
+            return chosen
+
+        return await self._import(scheme)
+
+    def _take_suitable(self, scheme):
+        """Pop and return a suitable proxy from the known pool, if any."""
+        # Newcomers are least proven, so prefer them. They must still be
+        # filtered by scheme: an HTTP-only newcomer cannot serve a
+        # CONNECT/HTTPS request.
+        for i, proxy in enumerate(self._newcomers):
+            if scheme in proxy.schemes:
+                return self._newcomers.pop(i)
+
+        # Otherwise take the best proven proxy from the heap, restoring
+        # the ones we skipped past.
+        temp_items = []
+        chosen = None
+        while self._pool:
+            priority, proxy = heapq.heappop(self._pool)
+            if scheme in proxy.schemes:
+                chosen = proxy
+                break
+            temp_items.append((priority, proxy))
+
+        for item in temp_items:
+            heapq.heappush(self._pool, item)
 
         return chosen
 
@@ -293,14 +305,26 @@ class Server:
                 log.debug("CancelledError in server._handle:_on_completion")
                 exc = None
             if exc:
-                if isinstance(exc, NoProxyError):
-                    self.stop()
-                else:
-                    raise exc
+                # Never take down the whole server for one failed client.
+                # Expected errors (no proxy available, proxy failures) are
+                # handled inside _handle and answered to the client; anything
+                # reaching here is unexpected, so surface it in the logs.
+                log.error(f"client: {id(client_reader)}; error: {exc!r}")
 
         f = asyncio.create_task(self._handle(client_reader, client_writer))
         f.add_done_callback(_on_completion)
         self._connections[f] = (client_reader, client_writer)
+
+    async def _send_error(self, writer, code, reason):
+        """Best-effort error response; the peer may already be gone."""
+        try:
+            writer.write(
+                f"HTTP/1.1 {code} {reason}\r\n"
+                f"Content-Length: 0\r\nConnection: close\r\n\r\n".encode()
+            )
+            await writer.drain()
+        except (ConnectionResetError, OSError):
+            pass
 
     async def _handle(self, client_reader, client_writer):
         log.debug(
@@ -361,7 +385,15 @@ class Server:
 
         for attempt in range(self._max_tries):
             stime, err = 0, None
-            proxy = await self._proxy_pool.get(scheme)
+            try:
+                proxy = await self._proxy_pool.get(scheme)
+            except NoProxyError:
+                # No proxy to handle this request right now. Answer the
+                # client with an error and keep the server running instead
+                # of tearing the whole server down.
+                log.debug(f"client: {client}; no proxy available for {scheme}")
+                await self._send_error(client_writer, 502, "Bad Gateway")
+                return
             proto = self._choice_proto(proxy, scheme)
             log.debug(
                 f"client: {client}; attempt: {attempt}; proxy: {proxy}; proto: {proto}"

@@ -11,6 +11,7 @@ Based on the real usage pattern from examples/proxy_server.py
 """
 
 import asyncio
+from collections import Counter
 from unittest.mock import MagicMock
 
 import pytest
@@ -364,3 +365,92 @@ class TestProxyPool:
         """The class explicitly raises ValueError for non-'best' strategies."""
         with pytest.raises(ValueError, match="strategy"):
             ProxyPool(asyncio.Queue(), strategy="random")
+
+    # --- Regression tests for real-pool behaviour ---
+
+    def _real_proxy(
+        self, port, schemes=("HTTP", "HTTPS"), requests=10, runtimes=(0.5,)
+    ):
+        """Build a real (non-mock) Proxy usable by ProxyPool internals."""
+        p = Proxy("192.0.2.1", port, types=tuple(schemes))
+        p.types = {s: ("High" if s == "HTTP" else None) for s in schemes}
+        p.stat = {"requests": requests, "errors": Counter()}
+        p._runtimes = list(runtimes)
+        return p
+
+    def test_put_handles_equal_response_times(self):
+        """Proxies with identical avg_resp_time must not corrupt the heap.
+
+        Regression: heapq compared the Proxy objects when the float
+        priority tied, raising ``TypeError: '<' not supported between
+        instances of 'Proxy'`` and leaving ``_pool`` unordered.
+        """
+        pool = ProxyPool(asyncio.Queue(), min_req_proxy=5)
+        for port in range(9000, 9005):
+            pool.put(self._real_proxy(port, requests=10, runtimes=(1.0,)))
+        assert len(pool._pool) == 5
+        # All five must remain in the pool (valid heap, none lost).
+        assert {p[1].port for p in pool._pool} == {9000, 9001, 9002, 9003, 9004}
+
+    @pytest.mark.asyncio
+    async def test_get_serves_available_proxy_when_source_empty(self):
+        """A pooled proxy must be served even when the broker queue is empty.
+
+        Regression: ``get()`` forced an import whenever the pool held
+        fewer than ``min_queue`` proxies, raising NoProxyError although a
+        perfectly usable proxy was already available.
+        """
+        pool = ProxyPool(
+            asyncio.Queue(), min_queue=5, min_req_proxy=5, import_timeout=0.3
+        )
+        proxy = self._real_proxy(9000, requests=10)
+        pool.put(proxy)
+
+        got = await pool.get("HTTP")
+
+        assert got is proxy
+
+    @pytest.mark.asyncio
+    async def test_get_skips_newcomer_without_requested_scheme(self):
+        """``get('HTTPS')`` must never return an HTTP-only newcomer.
+
+        Regression: newcomers were popped without any scheme check, so a
+        CONNECT/HTTPS request could receive an HTTP-only proxy and blow up
+        later in ``_choice_proto``.
+        """
+        pool = ProxyPool(
+            asyncio.Queue(), min_queue=5, min_req_proxy=5, import_timeout=0.3
+        )
+        for port in range(9100, 9105):
+            pool.put(self._real_proxy(port, schemes=("HTTP",), requests=1))
+
+        with pytest.raises(NoProxyError):
+            await pool.get("HTTPS")
+
+
+class TestServerNoProxyHandling:
+    """The server must not kill itself when the proxy pool is empty."""
+
+    @pytest.mark.asyncio
+    async def test_empty_pool_returns_502_and_keeps_serving(self, monkeypatch):
+        """No proxies -> client gets an error, server keeps listening."""
+        server = Server(
+            "127.0.0.1", 0, asyncio.Queue(), timeout=1, import_timeout=0.3
+        )
+        stopped = {"called": False}
+        monkeypatch.setattr(server, "stop", lambda: stopped.update(called=True))
+
+        await server.start()
+        port = server._server.sockets[0].getsockname()[1]
+
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        await writer.drain()
+        resp = await asyncio.wait_for(reader.read(1024), timeout=5)
+        writer.close()
+
+        assert b"502" in resp
+        assert stopped["called"] is False
+        assert server._server is not None
+
+        await server.aclose()
