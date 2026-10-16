@@ -423,6 +423,9 @@ class Broker:
                         await self._handle(proxy, check=check)
             log.debug("Grab cycle is complete")
             if self._server:
+                # Keep the pool filled: poll every few seconds instead of the
+                # old 180s pause. When the pool is empty/low we re-grab
+                # almost immediately.
                 try:
                     pool_size = self._server._proxy_pool.qsize()
                     threshold = getattr(
@@ -430,15 +433,20 @@ class Broker:
                     )
                 except Exception:
                     pool_size, threshold = 0, 0
-                if pool_size < threshold:
+                if pool_size == 0:
+                    delay = 1
+                    log.debug(f"pool empty, re-grabbing in {delay}s")
+                elif pool_size < threshold:
+                    delay = 3
                     log.debug(
-                        f"pool low ({pool_size} < {threshold}), re-grabbing immediately"
+                        f"pool low ({pool_size} < {threshold}), re-grabbing in {delay}s"
                     )
-                    await asyncio.sleep(1)
                 else:
-                    log.debug(f"fall asleep for {GRAB_PAUSE} seconds")
-                    await asyncio.sleep(GRAB_PAUSE)
-                    log.debug("awaked")
+                    delay = 5
+                    log.debug(
+                        f"pool ok ({pool_size} >= {threshold}), next check in {delay}s"
+                    )
+                await asyncio.sleep(delay)
             else:
                 break
         await self._on_check.join()
