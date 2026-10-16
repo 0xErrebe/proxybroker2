@@ -124,6 +124,10 @@ class ProxyPool:
             f"Exceeded max retries ({self._max_import_retries}) finding proxy with scheme {expected_scheme}"
         )
 
+    def qsize(self):
+        """Number of proxies currently kept in the pool (newcomers + heap)."""
+        return len(self._newcomers) + len(self._pool)
+
     def put(self, proxy):
         if proxy is None:
             return  # Ignore None proxies
@@ -468,8 +472,10 @@ class Server:
                     # returned, so do not consider this error of proxy
                     break
                 err = e
-                if scheme == "HTTPS":  # SSL Handshake probably failed
-                    break
+                # Retry with next proxy for both HTTP and HTTPS. Previously
+                # HTTPS broke immediately here, which prevented rotation
+                # (user wants: rotate until SUCCESS or MAX_RETRY).
+                continue
             else:
                 break
             finally:

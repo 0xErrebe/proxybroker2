@@ -423,9 +423,22 @@ class Broker:
                         await self._handle(proxy, check=check)
             log.debug("Grab cycle is complete")
             if self._server:
-                log.debug(f"fall asleep for {GRAB_PAUSE} seconds")
-                await asyncio.sleep(GRAB_PAUSE)
-                log.debug("awaked")
+                try:
+                    pool_size = self._server._proxy_pool.qsize()
+                    threshold = getattr(
+                        self._server._proxy_pool, "_min_queue", 5
+                    )
+                except Exception:
+                    pool_size, threshold = 0, 0
+                if pool_size < threshold:
+                    log.debug(
+                        f"pool low ({pool_size} < {threshold}), re-grabbing immediately"
+                    )
+                    await asyncio.sleep(1)
+                else:
+                    log.debug(f"fall asleep for {GRAB_PAUSE} seconds")
+                    await asyncio.sleep(GRAB_PAUSE)
+                    log.debug("awaked")
             else:
                 break
         await self._on_check.join()
