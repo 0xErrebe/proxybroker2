@@ -32,6 +32,64 @@ def test_ssl_context_verified_when_requested():
     assert p._ssl_context is True
 
 
+class _DummyTransport:
+    """Minimal transport stub for the SSL-upgrade unit test."""
+
+    def set_write_buffer_limits(self, *args, **kwargs):
+        pass
+
+    def get_extra_info(self, *args, **kwargs):
+        return None
+
+    def close(self):
+        pass
+
+    def is_closing(self):
+        return False
+
+    def write(self, data):
+        pass
+
+
+class _DummyConnWriter:
+    """Stands in for the pre-TLS StreamWriter (only .transport is used)."""
+
+    transport = _DummyTransport()
+
+
+@pytest.mark.asyncio
+async def test_connect_ssl_keeps_reader_alive(monkeypatch):
+    """Regression: the TLS StreamReader must survive the SSL upgrade.
+
+    CPython's ``StreamReaderProtocol`` keeps only a *weak* reference to
+    the reader it is handed, so building it inline
+    (``StreamReaderProtocol(StreamReader())``) lets the reader be
+    garbage-collected immediately. ``protocol._stream_reader`` then
+    returns ``None``, ``Proxy.reader`` falls back to the stale pre-TLS
+    reader, and every HTTPS response read times out - silently preventing
+    any HTTPS proxy from ever passing its check (permanent 502).
+
+    The TLS handshake is stubbed out (no certificate needed); we only
+    assert that ``connect(ssl=True)`` leaves a live reader behind.
+    """
+    loop = asyncio.get_running_loop()
+    proxy = Proxy("127.0.0.1", "80", timeout=1)
+    proxy._writer["conn"] = _DummyConnWriter()
+
+    async def fake_start_tls(transport, protocol, sslcontext, **kwargs):
+        return _DummyTransport()
+
+    monkeypatch.setattr(loop, "start_tls", fake_start_tls, raising=False)
+
+    await proxy.connect(ssl=True)
+
+    assert proxy._reader["ssl"] is not None
+    assert isinstance(proxy._reader["ssl"], StreamReader)
+    # The public accessor must resolve to the TLS reader, not the stale
+    # pre-TLS one (or None).
+    assert proxy.reader is proxy._reader["ssl"]
+
+
 def test_proxy_accepts_ipv6_host_literal():
     """Proxy(host=v6) must construct without raising.
 

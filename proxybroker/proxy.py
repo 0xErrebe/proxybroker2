@@ -374,7 +374,15 @@ class Proxy:
                 # For SSL connections over existing proxy connection, we need to upgrade
                 # the existing connection to SSL. Use start_tls to avoid deprecated socket access.
                 transport = self._writer["conn"].transport
-                protocol = asyncio.StreamReaderProtocol(asyncio.StreamReader())
+                # Hold a strong reference to the reader for the lifetime of
+                # the SSL connection. CPython's StreamReaderProtocol keeps
+                # only a weakref to the reader it is given, so building it
+                # inline (`StreamReaderProtocol(StreamReader())`) lets the
+                # reader be garbage-collected immediately; `protocol._stream_reader`
+                # then returns None and TLS reads silently fall back to the
+                # stale pre-TLS reader, so every HTTPS response times out.
+                ssl_reader = asyncio.StreamReader()
+                protocol = asyncio.StreamReaderProtocol(ssl_reader)
 
                 # Upgrade transport to SSL
                 ssl_transport = await asyncio.wait_for(
@@ -388,11 +396,11 @@ class Proxy:
                 )
 
                 # Create new reader/writer for SSL connection
-                self._reader[_type] = protocol._stream_reader
+                self._reader[_type] = ssl_reader
                 self._writer[_type] = asyncio.StreamWriter(
                     ssl_transport,
                     protocol,
-                    self._reader[_type],
+                    ssl_reader,
                     asyncio.get_running_loop(),
                 )
             else:
